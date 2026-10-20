@@ -2812,6 +2812,13 @@ function vSettings(){
         <button class="btn btn-ghost btn-sm" id="runCleanup">Run cleanup now</button>
         <span id="cleanupMsg" class="dim" style="font-size:var(--fs-sm)"></span></div></div>
 
+    <div class="panel"><h3>Connection</h3>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:14px;padding:10px 0">
+        <div><div style="font-size:var(--fs-md)">Firebase</div>
+          <div class="dim" style="font-size:var(--fs-sm)">Accounts, database and file storage</div></div>
+        <span id="fbStatus" class="dim" style="font-size:var(--fs-sm);text-align:right">checking…</span>
+      </div></div>
+
     <div class="panel"><h3>Demo data</h3>
       <p class="muted" style="font-size:var(--fs-md);margin:6px 0 12px">This build stores everything in your browser. Resetting restores the original demo content.</p>
       <button class="btn btn-danger" id="resetAll">Reset demo data</button></div>
@@ -2819,6 +2826,16 @@ function vSettings(){
 }
 function wireSettings(){
   const u=me();if(!u)return;const s=DB.settings;
+  const paintFb=()=>{
+    const el=$('#fbStatus'); if(!el) return;
+    const st=window.ZMFB||{};
+    if(st.ready){el.textContent='Connected'+(st.analytics?' · analytics on':'')+(st.source?' · '+st.source:'');el.style.color='var(--ok)';}
+    else if(st.error){el.textContent='Not loaded — app still works offline';el.style.color='var(--warn)';}
+    else {el.textContent='Connecting…';el.style.color='var(--text-3)';}
+  };
+  paintFb();
+  window.removeEventListener('zmfb-status',paintFb);
+  window.addEventListener('zmfb-status',paintFb);
   $('#sPrivSave').onclick=()=>{u.privacy=$('#sStatusP').value==='members'?'members':'public';
     s.privacy.showStatus=$('#sStatusP').value;s.privacy.allowDms=$('#sDm').value;save();toast('Privacy saved','ok');};
   $$('[data-notif]').forEach(c=>c.onchange=()=>{s.notif[c.dataset.notif]=c.checked?1:0;save();});
@@ -3483,6 +3500,53 @@ READY.finally(()=>{seedPresence();cleanupPass();render();
 });
 let PRESENCE_KEY='';
 ['click','keydown','touchstart','scroll'].forEach(ev=>document.addEventListener(ev,touchPresence,{passive:true}));
+</script>
+<!-- ============================================================================
+     FIREBASE  (optional)
+     The Firebase web config below is NOT a secret — it is designed to be public
+     and ships in the client of every Firebase web app. Security comes from your
+     Firebase Security Rules, never from hiding this block.
+     The app runs perfectly well without Firebase: if the SDK cannot load, this
+     script gives up quietly and everything keeps working offline.
+     ============================================================================ -->
+<script type="module">
+(async () => {
+  const V = "10.14.1";
+  const BASES = [
+    "https://www.gstatic.com/firebasejs/" + V + "/",
+    "https://cdn.jsdelivr.net/npm/firebase@" + V + "/"
+  ];
+  const state = { ready:false, app:null, analytics:null, source:null, error:null };
+  window.ZMFB = state;
+  const announce = () => window.dispatchEvent(new CustomEvent("zmfb-status"));
+
+  for (const base of BASES) {
+    try {
+      const { initializeApp } = await import(base + "firebase-app.js");
+      const app = initializeApp({
+        apiKey: "AIzaSyDlkEc43vZDTMA5o1Yb9Y1pywALEviBods",
+        authDomain: "bv-martket-91f88.firebaseapp.com",
+        projectId: "bv-martket-91f88",
+        storageBucket: "bv-martket-91f88.firebasestorage.app",
+        messagingSenderId: "566052095977",
+        appId: "1:566052095977:web:a6606234a0c47b860dad78",
+        measurementId: "G-GSQNZTQT90"
+      });
+      state.app = app;
+      state.source = base.indexOf("gstatic") > -1 ? "gstatic" : "jsdelivr";
+      try {
+        const { getAnalytics, isSupported } = await import(base + "firebase-analytics.js");
+        if (await isSupported()) state.analytics = getAnalytics(app);
+      } catch (e) { /* analytics is optional */ }
+      state.ready = true;
+      break;
+    } catch (e) {
+      state.error = (e && e.message) || String(e);
+    }
+  }
+  if (!state.ready) console.warn("[ZERO MERCY] Firebase not loaded — running offline:", state.error);
+  announce();
+})();
 </script>
 </body>
 </html>
