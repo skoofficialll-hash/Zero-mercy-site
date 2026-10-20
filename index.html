@@ -1187,6 +1187,114 @@ function typingLabel(ch){
 }
 
 /* ============================================================================
+   CONFIG — fill this in after you deploy the LiveKit token Worker
+   ============================================================================ */
+window.ZM_CONFIG = window.ZM_CONFIG || {
+  /* e.g. "https://zero-mercy-voice.your-name.workers.dev" */
+  livekitTokenUrl: ""
+};
+
+/* ============================================================================
+   LIVEKIT VOICE
+   The browser never holds your LiveKit secret. It asks the Cloudflare Worker
+   for a short-lived token, then connects straight to the LiveKit room.
+   ============================================================================ */
+const LK_SDK = "2.23.0";
+let LK_MOD=null, LK_ROOM=null, LK_STATE="idle", LK_ERR=null, LK_ROOMNAME=null;
+
+const lkConfigured=()=>!!(window.ZM_CONFIG&&String(window.ZM_CONFIG.livekitTokenUrl||"").trim());
+const lkReady=()=>lkConfigured()&&fbReady()&&!!fbUser();
+
+async function lkLoad(){
+  if(LK_MOD)return LK_MOD;
+  const urls=[
+    "https://cdn.jsdelivr.net/npm/livekit-client@"+LK_SDK+"/+esm",
+    "https://esm.sh/livekit-client@"+LK_SDK
+  ];
+  let last=null;
+  for(const u of urls){ try{ LK_MOD=await import(u); return LK_MOD; }catch(e){ last=e; } }
+  throw new Error("The voice SDK could not be loaded"+(last?" ("+last.message+")":""));
+}
+async function lkToken(roomName){
+  if(!lkConfigured())throw new Error("Voice is not configured yet. Deploy the token Worker and put its URL in livekitTokenUrl.");
+  const user=fbUser();
+  if(!user)throw new Error("Voice needs a real account. Sign in with Google or email first.");
+  const idToken=await user.getIdToken();
+  const res=await fetch(String(window.ZM_CONFIG.livekitTokenUrl).replace(/\/+$/,""),{
+    method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify({idToken,room:roomName})
+  });
+  let data={};try{ data=await res.json(); }catch(e){}
+  if(!res.ok)throw new Error(data.error||("The token service refused the request ("+res.status+")"));
+  if(!data.token||!data.url)throw new Error("The token service returned no token.");
+  return data;
+}
+async function lkVoiceJoin(channelId){
+  const u=me();
+  if(!u){ toast("Sign in first.","bad"); return; }
+  LK_STATE="connecting";LK_ERR=null;LK_ROOMNAME=channelId;VOICE=channelId;render();
+  try{
+    const {token,url}=await lkToken(channelId);
+    const LK=await lkLoad();
+    const room=new LK.Room({
+      adaptiveStream:true,dynacast:true,
+      audioCaptureDefaults:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}
+    });
+    room
+      .on(LK.RoomEvent.TrackSubscribed,t=>{
+        if(t.kind==="audio"){try{const el=t.attach();el.autoplay=true;el.style.display="none";document.body.appendChild(el);}catch(e){}}
+      })
+      .on(LK.RoomEvent.TrackUnsubscribed,t=>{try{t.detach().forEach(e=>e.remove());}catch(e){}})
+      .on(LK.RoomEvent.ParticipantConnected,()=>{if(ROUTES[VIEW])render();})
+      .on(LK.RoomEvent.ParticipantDisconnected,()=>{if(ROUTES[VIEW])render();})
+      .on(LK.RoomEvent.ActiveSpeakersChanged,()=>{if(ROUTES[VIEW])render();})
+      .on(LK.RoomEvent.TrackMuted,()=>{if(ROUTES[VIEW])render();})
+      .on(LK.RoomEvent.TrackUnmuted,()=>{if(ROUTES[VIEW])render();})
+      .on(LK.RoomEvent.Reconnecting,()=>{LK_STATE="reconnecting";if(ROUTES[VIEW])render();})
+      .on(LK.RoomEvent.Reconnected,()=>{LK_STATE="live";if(ROUTES[VIEW])render();})
+      .on(LK.RoomEvent.Disconnected,()=>{LK_ROOM=null;LK_STATE="idle";LK_ROOMNAME=null;if(ROUTES[VIEW])render();});
+    await room.connect(url,token);
+    LK_ROOM=room;
+    try{ await room.localParticipant.setMicrophoneEnabled(!VMUTE); }catch(e){}
+    try{ await room.startAudio(); }catch(e){}
+    LK_STATE="live";VMUTE=room.localParticipant.isMicrophoneEnabled?0:1;
+    toast("Joined the voice room","ok");
+    render();
+  }catch(err){
+    LK_STATE="error";LK_ERR=(err&&err.message)||String(err);
+    render();
+    toast(LK_ERR,"bad");
+  }
+}
+async function lkVoiceLeave(){
+  try{ if(LK_ROOM)await LK_ROOM.disconnect(); }catch(e){}
+  LK_ROOM=null;LK_STATE="idle";LK_ERR=null;LK_ROOMNAME=null;VOICE=null;render();
+}
+async function lkToggleMic(){
+  if(!LK_ROOM)return;
+  try{
+    await LK_ROOM.localParticipant.setMicrophoneEnabled(!!VMUTE);
+    VMUTE=LK_ROOM.localParticipant.isMicrophoneEnabled?0:1;
+    render();
+  }catch(e){toast("Could not change the microphone state.","bad");}
+}
+function lkPeople(){
+  if(!LK_ROOM)return [];
+  const out=[];
+  const pack=(p,self)=>({
+    key:p.identity,
+    name:p.name||p.identity,
+    self,
+    muted:!p.isMicrophoneEnabled,
+    speaking:!!p.isSpeaking,
+    photo:(()=>{try{return JSON.parse(p.metadata||"{}").photo||null;}catch(e){return null;}})()
+  });
+  try{ if(LK_ROOM.localParticipant)out.push(pack(LK_ROOM.localParticipant,true)); }catch(e){}
+  try{ LK_ROOM.remoteParticipants.forEach(p=>out.push(pack(p,false))); }catch(e){}
+  return out;
+}
+
+/* ============================================================================
    FIREBASE AUTH BRIDGE
    Real accounts when Firebase is reachable; the local demo accounts keep
    working when it is not, so the app never breaks.
@@ -1202,8 +1310,17 @@ async function doGoogleSignIn(btn,msg){
   msg.className='auth-msg';msg.textContent='';
   try{
     const res=await window.ZMFB.fb.signInWithGoogle();
-    if(res&&res.user){ await fbSyncSession(res.user.uid); toast('Signed in with Google','ok'); setTimeout(()=>go('home'),150); }
-    /* a redirect flow navigates away and returns by itself */
+    if(res===null){ btn.textContent='Redirecting to Google…'; return; }   /* mobile redirect */
+    if(res&&res.user){
+      const mid=await fbSyncSession(res.user.uid);
+      toast('Signed in with Google','ok');
+      setTimeout(()=>go('home'),150);
+      if(!mid){ msg.className='auth-msg bad'; msg.textContent='Signed in, but your profile could not be loaded.'; }
+      return;
+    }
+    btn.disabled=false;btn.innerHTML=label;
+    msg.className='auth-msg bad';
+    msg.textContent='Google did not return an account. Please try again.';
   }catch(err){
     msg.className='auth-msg bad';msg.textContent=fbErr(err);
     btn.disabled=false;btn.innerHTML=label;
@@ -1247,14 +1364,27 @@ function memberFromProfile(p,id){
 async function fbSyncSession(uid){
   if(!fbReady()||!uid)return null;
   const user=window.ZMFB.fb.current();
-  let prof=null;
+  if(!user||user.uid!==uid)return null;
+  let prof=null,blocked=null;
   try{
     /* ensureProfile creates a users/{uid} document the first time someone signs in
        (Google sign-in in particular arrives with no profile yet) */
-    prof = (user && user.uid===uid && window.ZMFB.fb.ensureProfile)
+    prof=(window.ZMFB.fb.ensureProfile)
       ? await window.ZMFB.fb.ensureProfile(user)
       : await window.ZMFB.fb.getProfile(uid);
-  }catch(e){ return null; }
+  }catch(e){
+    /* Firestore refused (usually locked-down rules). Sign-in must still complete,
+       so build a local-only profile from the auth account and warn clearly. */
+    blocked=(e&&e.code)||'permission-denied';
+    const base=(user.displayName||(user.email||'').split('@')[0]||'member').replace(/[^A-Za-z0-9_]/g,'').slice(0,18)||'member';
+    prof={ uid:user.uid, zmId:'ZM'+String(user.uid).slice(0,4).toUpperCase(),
+      username:base, email:user.email||'', photoURL:user.photoURL||null,
+      role:'Member', points:0, eventsWon:0, totalPosts:0,
+      bio:'', statusMsg:'', privacy:'public', verified:false,
+      badges:[], socials:[], frame:'', banner:'', hiddenBadges:[], rulesVersion:0,
+      joinDate:new Date().toISOString() };
+  }
+  window.ZMFB.profileBlocked=blocked;
   if(!prof)return null;
   DB.fbMap=DB.fbMap||{};
   let mid=DB.fbMap[uid];
@@ -1268,6 +1398,7 @@ async function fbSyncSession(uid){
     else DB.members.push(memberFromProfile(prof,mid));
   }
   DB.session=mid;save();
+  if(blocked)setTimeout(()=>toast('Signed in, but Firestore blocked your profile — your rules are still locked. Paste the rules from the guide.','bad'),400);
   return mid;
 }
 window.addEventListener('zmauth',async ev=>{
@@ -2125,7 +2256,7 @@ function vVoice(){
   const joined=VOICE?DB.channels.find(c=>c.id===VOICE):null;
   return `<div class="page">
     <div class="page-head"><div><div class="eyebrow">Live audio</div><h1>Voice Rooms</h1>
-      <p>Join a room to talk. Microphone capture, mute and level detection are real; audio between members needs the voice service.</p></div></div>
+      <p>${lkReady()?'Join a room and talk — audio runs live through LiveKit.':lkConfigured()?'Voice is configured, but you need a real account (Google or email) to join.':'Voice is not configured yet — deploy the token Worker and add its URL to ZM_CONFIG.livekitTokenUrl.'}</p></div></div>
     ${joined?voiceRoom(joined):''}
     ${!joined?`<div class="grid g2">${rooms.length?rooms.map(c=>{
       const st=DB.voice[c.id]||{members:[]};
@@ -2138,8 +2269,43 @@ function vVoice(){
       </div>`;}).join(''):stateBlock('empty',{title:'No voice rooms available',msg:'You do not have access to any voice rooms yet.'})}</div>`:''}
   </div>`;
 }
+function lkRoomView(ch){
+  const people=lkPeople();
+  const reconn=LK_STATE==='reconnecting';
+  return `<div class="room" style="margin-bottom:18px">
+    <div class="room-head">
+      ${ico('voice')}<h3>${esc(ch.name)}</h3>
+      <span class="pill ${reconn?'amber':'green'}">${reconn?'Reconnecting':'Live audio'}</span>
+      <span class="dim" style="font-size:var(--fs-sm)">${VMUTE?'muted':'mic on'}</span>
+      <span class="count dim" style="font-size:var(--fs-sm);margin-left:auto">${people.length} connected</span>
+    </div>
+    <div class="tiles">
+      ${people.map(p=>`<div class="tile ${p.speaking?'speaking':''}">
+        ${p.photo?`<span class="avatar md"><img src="${esc(p.photo)}" alt=""></span>`:avatar({username:p.name},'md')}
+        <div class="nm">${esc(p.name)}${p.self?' <span class="dim">(you)</span>':''}</div>
+        <div class="tagline">${p.muted?'muted':p.speaking?'speaking':p.self?'you':''}</div></div>`).join('')
+        || '<div class="dim" style="padding:14px">Waiting for others to join…</div>'}
+    </div>
+    <p class="dim" style="font-size:var(--fs-sm);margin-top:12px">Connected through LiveKit — audio travels directly between browsers and nothing is recorded.</p>
+    <div class="controls">
+      <button class="vc ${VMUTE?'on':''}" id="vcMute" aria-pressed="${VMUTE?'true':'false'}">${ico(VMUTE?'micOff':'voice')}<span>${VMUTE?'Unmute':'Mute'}</span></button>
+      <button class="vc" id="vcInvite">${ico('link')}<span>Invite</span></button>
+      <button class="vc danger" id="vcLeave" style="margin-left:auto">${ico('logout')}<span>Leave</span></button>
+    </div>
+  </div>`;
+}
 function voiceRoom(ch){
   const u=me();
+  if(LK_ROOMNAME===ch.id&&(LK_STATE==='live'||LK_STATE==='reconnecting'))return lkRoomView(ch);
+  if(LK_ROOMNAME===ch.id&&LK_STATE==='connecting'){
+    return `<div class="room" style="margin-bottom:18px">${stateBlock('loading',{
+      title:'Connecting to the voice room…',msg:'Getting a secure token and opening the audio connection.'})}</div>`;
+  }
+  if(LK_ROOMNAME===ch.id&&LK_STATE==='error'){
+    return `<div class="room" style="margin-bottom:18px">${stateBlock('error',{
+      title:'Could not join the voice room',msg:esc(LK_ERR||'Something went wrong.'),
+      actions:[{label:'Try again',act:'vtry',primary:1},{label:'Leave',act:'vleave'}]})}</div>`;
+  }
   const st=DB.voice[ch.id]||(DB.voice[ch.id]={members:[],speaking:[],locked:false,hands:[],muted:[]});
   if(VOICE_STATE==='joining'||VOICE_STATE==='permission'){
     return `<div class="room" style="margin-bottom:18px">${stateBlock('loading',{
@@ -2187,12 +2353,18 @@ function voiceRoom(ch){
   </div>`;
 }
 function wireVoice(){
-  wireActs({vtry:()=>joinVoice(VOICE),vleave:()=>{leaveVoice();go('voice');}});
-  $$('[data-vjoin]').forEach(b=>b.onclick=()=>joinVoice(b.dataset.vjoin));
+  wireActs({
+    vtry:()=>{ if(lkConfigured())lkVoiceJoin(LK_ROOMNAME||VOICE); else joinVoice(VOICE); },
+    vleave:()=>{ if(LK_ROOM)lkVoiceLeave(); else { leaveVoice(); go('voice'); } }
+  });
+  $$('[data-vjoin]').forEach(b=>b.onclick=()=>{
+    const id=b.dataset.vjoin;
+    if(lkReady())lkVoiceJoin(id); else joinVoice(id);
+  });
   const u=me();
   const st=VOICE?(DB.voice[VOICE]||{}):null;
   if(VOICE&&st&&(VOICE_STATE==='connected'||VOICE_STATE==='reconnecting')){
-    $('#vcMute').onclick=()=>setMute(!VMUTE);
+    $('#vcMute').onclick=()=>{ if(LK_ROOM)lkToggleMic(); else setMute(!VMUTE); };
     $('#vcDeaf').onclick=()=>{VDEAF=VDEAF?0:1;toast(VDEAF?'Deafened':'Undeafened');render();};
     $('#vcHand').onclick=()=>{VHAND=VHAND?0:1;st.hands=st.hands||[];
       if(u){if(VHAND){if(!st.hands.includes(u.id))st.hands.push(u.id);}else st.hands=st.hands.filter(x=>x!==u.id);}save();render();};
@@ -2980,7 +3152,9 @@ function wireSettings(){
   const paintAuth=()=>{
     const el=$('#authStatus'); if(!el) return;
     const u=fbUser();
-    if(u){el.textContent='Signed in · '+(u.email||'account');el.style.color='var(--ok)';}
+    const blocked=window.ZMFB&&window.ZMFB.profileBlocked;
+    if(u&&blocked){el.textContent='Signed in · Firestore blocked';el.style.color='var(--accent-2)';}
+    else if(u){el.textContent='Signed in · '+(u.email||'account');el.style.color='var(--ok)';}
     else if(fbReady()){el.textContent='Not signed in';el.style.color='var(--text-3)';}
     else {el.textContent='Demo accounts (offline)';el.style.color='var(--warn)';}
   };
@@ -3848,6 +4022,11 @@ let PRESENCE_KEY='';
           const provider = new A.GoogleAuthProvider();
           /* force the account chooser even if the browser is already signed in */
           provider.setCustomParameters({ prompt: "select_account" });
+          const mobile = /Android|iPhone|iPad|iPod|Mobile|Silk/i.test(navigator.userAgent || "");
+          if (mobile) {
+            await A.signInWithRedirect(auth, provider);
+            return null;               /* the page navigates away and comes back */
+          }
           try {
             return await A.signInWithPopup(auth, provider);
           } catch (e) {
