@@ -1038,7 +1038,7 @@ if(!DB||!DB.members||!DB.channels)DB=defaultDB();
 /* heal older shapes */
 if(!DB.voice)DB.voice={};if(!DB.owned)DB.owned={};if(!DB.reads)DB.reads={};
 if(!DB.saved)DB.saved={};if(!DB.dismissed)DB.dismissed={};if(!DB.dmRead)DB.dmRead={};
-if(!DB.friends)DB.friends={};if(!DB.frequests)DB.frequests=[];if(!DB.imgAt)DB.imgAt={};if(!DB.lastSeen)DB.lastSeen={};if(!DB.typing)DB.typing={};
+if(!DB.friends)DB.friends={};if(!DB.frequests)DB.frequests=[];if(!DB.imgAt)DB.imgAt={};if(!DB.fbMap)DB.fbMap={};if(!DB.lastSeen)DB.lastSeen={};if(!DB.typing)DB.typing={};
 DB.members.forEach(m=>{if(m.theme&&!m.banner)m.banner=m.theme;delete m.theme;delete m.frameImg;});
 DB.events.forEach(e=>{if(!e.starts_at){const d=new Date(String(e.date)+'T18:00:00');
   e.starts_at=(isNaN(d)?new Date(e.date):d).toISOString();
@@ -1148,6 +1148,75 @@ function typingLabel(ch){
   if(u&&t.user===u.username)return '';
   return `<span class="typing">${esc(t.user)} is typing…</span>`;
 }
+
+/* ============================================================================
+   FIREBASE AUTH BRIDGE
+   Real accounts when Firebase is reachable; the local demo accounts keep
+   working when it is not, so the app never breaks.
+   ============================================================================ */
+const fbReady=()=>!!(window.ZMFB&&window.ZMFB.ready&&window.ZMFB.fb);
+const fbUser=()=>(window.ZMAUTH&&window.ZMAUTH.user)||null;
+function fbErr(e){
+  const c=String((e&&e.code)||'');
+  if(/invalid-credential|wrong-password|user-not-found|invalid-login/.test(c))return 'Email or password is incorrect.';
+  if(/invalid-email/.test(c))return 'That email address does not look right.';
+  if(/too-many-requests/.test(c))return 'Too many attempts. Wait a minute and try again.';
+  if(/email-already-in-use/.test(c))return 'That email is already registered — try signing in.';
+  if(/weak-password/.test(c))return 'Password must be at least 6 characters.';
+  if(/network/.test(c))return 'Network problem. Check your connection and try again.';
+  if(/operation-not-allowed/.test(c))return 'Email sign-in is not enabled in your Firebase project.';
+  if(/permission-denied/.test(c))return 'Signed in, but Firestore blocked the profile write. Check your security rules.';
+  return (e&&e.message)||'Something went wrong. Please try again.';
+}
+function memberFromProfile(p,id){
+  return {
+    id,
+    uid:p.zmId||('ZM'+String(id).padStart(4,'0')),
+    username:p.username||'member', email:p.email||'',
+    role:p.role||'Member', avatar:p.avatar||null, bio:p.bio||'',
+    status_msg:p.statusMsg||'', privacy:p.privacy||'public',
+    verified:p.verified?1:0, status:'online',
+    events_won:p.eventsWon||0, total_posts:p.totalPosts||0,
+    achievements:p.achievements||'', badges:p.badges||[], socials:p.socials||[],
+    frame:p.frame||'', banner:p.banner||'',
+    region:p.region||'', playstyle:p.playstyle||'', fav_game:p.favGame||'',
+    hiddenBadges:p.hiddenBadges||[], rules_version:p.rulesVersion||0,
+    join_date:p.joinDate||new Date().toISOString(), points:p.points||0,
+    fbUid:p.uid||''
+  };
+}
+async function fbSyncSession(uid){
+  if(!fbReady()||!uid)return null;
+  let prof=null;
+  try{ prof=await window.ZMFB.fb.getProfile(uid); }catch(e){ return null; }
+  if(!prof)return null;
+  DB.fbMap=DB.fbMap||{};
+  let mid=DB.fbMap[uid];
+  if(!mid){
+    mid=DB.members.reduce((a,m)=>Math.max(a,Number(m.id)||0),0)+1;
+    DB.fbMap[uid]=mid;
+    DB.members.push(memberFromProfile(prof,mid));
+  } else {
+    const m=mById(mid);
+    if(m)Object.assign(m,memberFromProfile(prof,mid));
+    else DB.members.push(memberFromProfile(prof,mid));
+  }
+  DB.session=mid;save();
+  return mid;
+}
+window.addEventListener('zmauth',async ev=>{
+  const d=(ev&&ev.detail)||{};
+  const before=DB.session;
+  if(d.uid){
+    try{ await fbSyncSession(d.uid); }catch(e){}
+  } else {
+    /* Firebase reports nobody signed in. Only end the session if it belonged to a
+       Firebase account — the local demo accounts must keep working. */
+    const cur=before?mById(before):null;
+    if(cur&&cur.fbUid){ DB.session=null;save(); }
+  }
+  if(DB.session!==before){ renderShell(); if(ROUTES[VIEW])render(); }
+});
 
 const me=()=>DB.session?DB.members.find(m=>m.id===DB.session)||null:null;
 const mById=id=>DB.members.find(m=>m.id===id);
@@ -1535,7 +1604,9 @@ function renderShell(){
       <button class="dd-item" id="logoutItem">${ico('logout')}<span>Sign out</span></button>`;
     dd.classList.add('show');
     $$('[data-go2]',dd).forEach(b=>b.onclick=()=>{dd.classList.remove('show');go(b.dataset.go2);});
-    $('#logoutItem',dd).onclick=()=>{DB.session=null;save();dd.classList.remove('show');toast('Signed out');
+    $('#logoutItem',dd).onclick=()=>{
+      if(fbReady()&&window.ZMFB.fb.current()){window.ZMFB.fb.signOut().catch(()=>{});}
+      DB.session=null;save();dd.classList.remove('show');toast('Signed out');
       if(location.hash==='#/home')render();else location.hash='#/home';};
   };
 
@@ -2817,6 +2888,11 @@ function vSettings(){
         <div><div style="font-size:var(--fs-md)">Firebase</div>
           <div class="dim" style="font-size:var(--fs-sm)">Accounts, database and file storage</div></div>
         <span id="fbStatus" class="dim" style="font-size:var(--fs-sm);text-align:right">checking…</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:14px;padding:10px 0;border-top:1px solid var(--line)">
+        <div><div style="font-size:var(--fs-md)">Your account</div>
+          <div class="dim" style="font-size:var(--fs-sm)">Firebase Authentication</div></div>
+        <span id="authStatus" class="dim" style="font-size:var(--fs-sm);text-align:right">checking…</span>
       </div></div>
 
     <div class="panel"><h3>Demo data</h3>
@@ -2833,9 +2909,18 @@ function wireSettings(){
     else if(st.error){el.textContent='Not loaded — app still works offline';el.style.color='var(--warn)';}
     else {el.textContent='Connecting…';el.style.color='var(--text-3)';}
   };
-  paintFb();
+  const paintAuth=()=>{
+    const el=$('#authStatus'); if(!el) return;
+    const u=fbUser();
+    if(u){el.textContent='Signed in · '+(u.email||'account');el.style.color='var(--ok)';}
+    else if(fbReady()){el.textContent='Not signed in';el.style.color='var(--text-3)';}
+    else {el.textContent='Demo accounts (offline)';el.style.color='var(--warn)';}
+  };
+  paintFb(); paintAuth();
   window.removeEventListener('zmfb-status',paintFb);
-  window.addEventListener('zmfb-status',paintFb);
+  window.addEventListener('zmfb-status',()=>{paintFb();paintAuth();});
+  window.removeEventListener('zmauth',paintAuth);
+  window.addEventListener('zmauth',paintAuth);
   $('#sPrivSave').onclick=()=>{u.privacy=$('#sStatusP').value==='members'?'members':'public';
     s.privacy.showStatus=$('#sStatusP').value;s.privacy.allowDms=$('#sDm').value;save();toast('Privacy saved','ok');};
   $$('[data-notif]').forEach(c=>c.onchange=()=>{s.notif[c.dataset.notif]=c.checked?1:0;save();});
@@ -3189,27 +3274,57 @@ function vLogin(){
       <h2 style="font-size:var(--fs-xl)">Sign in</h2>
       <p class="muted" style="margin:6px 0 20px;font-size:var(--fs-md)">Access your dashboard, channels and voice rooms.</p>
       <form id="loginForm">
-        <div class="field"><label for="lu">Username</label><input id="lu" name="username" required autocomplete="username" placeholder="your_username"></div>
+        <div class="field"><label for="lu">Email or username</label><input id="lu" name="username" required autocomplete="username" placeholder="you@example.com"></div>
         <div class="field"><label for="lp">Password</label><input id="lp" name="password" type="password" required autocomplete="current-password" placeholder="••••••••"></div>
         <button class="btn btn-primary btn-block" type="submit">Sign in</button>
         <p id="lmsg" style="font-size:var(--fs-md);margin-top:10px;color:var(--accent-2)" role="alert"></p></form>
       <div style="text-align:center;margin-top:16px;font-size:var(--fs-md);color:var(--text-2)">No account? <a class="accent" href="#/register">Register</a></div>
       <div style="height:1px;background:var(--line);margin:18px 0"></div>
-      <details><summary style="cursor:pointer;font-size:var(--fs-sm);color:var(--text-3)">Demo build — about this sign-in</summary>
-        <p class="dim" style="font-size:var(--fs-sm);margin-top:8px;line-height:1.6">This is a front-end demo: data lives in your browser and passwords are hashed locally. It is <b>not</b> real authentication — production uses Supabase Auth with server-side authorisation and RLS. Demo usernames: Zxro, Shadow, Reaper, Nova, Echo. The shared demo password is in the project README.</p></details>
+      <div style="text-align:center;margin-top:12px"><button class="btn btn-ghost btn-sm" id="forgotBtn" type="button">Forgot password?</button></div>
+      <details><summary style="cursor:pointer;font-size:var(--fs-sm);color:var(--text-3)">About this sign-in</summary>
+        <p class="dim" style="font-size:var(--fs-sm);margin-top:8px;line-height:1.6">Sign in with an <b>email address</b> and your account is handled by Firebase Authentication — the password never touches this app. Sign in with a <b>username</b> and you are using the built-in demo accounts (Zxro, Shadow, Reaper, Nova, Echo), which live only in your browser.</p></details>
     </div></div>`;
 }
 function wireLogin(){
   const f=$('#loginForm');if(!f)return;
+  const fg=$('#forgotBtn');
+  if(fg)fg.onclick=async()=>{
+    const msg=$('#lmsg');const v=$('#lu').value.trim();
+    if(!v||v.indexOf('@')<0){msg.style.color='var(--accent-2)';msg.textContent='Type your email address above first.';return;}
+    if(!fbReady()){msg.textContent='Password reset needs Firebase, which is not loaded right now.';return;}
+    try{ await window.ZMFB.fb.resetPassword(v);
+      msg.style.color='var(--ok)';msg.textContent='Reset link sent to '+v+'. Check your inbox.';
+    }catch(err){ msg.style.color='var(--accent-2)'; msg.textContent=fbErr(err); }
+  };
   f.onsubmit=async e=>{
     e.preventDefault();
     const btn=f.querySelector('button[type=submit]'),msg=$('#lmsg');
     const un=f.username.value.trim(),pw=f.password.value;msg.textContent='';
-    if(!un||!pw){msg.textContent='Enter your username and password.';return;}
+    if(!un||!pw){msg.textContent='Enter your email (or username) and password.';return;}
     const rl=rateLimit('login');
     if(rl.blocked){msg.textContent='Too many attempts. Try again in '+rl.retry+'s.';return;}
     btn.disabled=true;btn.textContent='Signing in…';
-    await READY;await new Promise(r=>setTimeout(r,300));
+    await READY;
+
+    /* ---- real account (Firebase) when the input is an email ---- */
+    if(fbReady()&&un.indexOf('@')>-1){
+      try{
+        const user=await window.ZMFB.fb.signIn(un,pw);
+        const mid=await fbSyncSession(user.uid);
+        rateLimit('login',false,true);
+        btn.textContent='Signed in';
+        toast('Welcome back','ok');
+        if(!mid){ msg.textContent='Signed in, but your profile could not be loaded. Check your Firestore rules.'; }
+        setTimeout(()=>go('home'),200);
+        return;
+      }catch(err){
+        rateLimit('login',true);
+        msg.textContent=fbErr(err);
+        btn.disabled=false;btn.textContent='Sign in';
+        return;
+      }
+    }
+    await new Promise(r=>setTimeout(r,300));
     const u=DB.members.find(m=>m.username.toLowerCase()===un.toLowerCase());
     const h=await hashPw(pw);
     if(!u||u.passwordHash!==h){rateLimit('login',true);msg.textContent='Invalid username or password.';
@@ -3240,23 +3355,60 @@ function wireRegister(){
     e.preventDefault();
     const btn=f.querySelector('button[type=submit]'),msg=$('#rmsg');
     const un=f.username.value.trim(),em=f.email.value.trim(),pw=f.password.value;
-    if(un.length<3){msg.textContent='Username must be at least 3 characters.';return;}
-    if(pw.length<6){msg.textContent='Password must be at least 6 characters.';return;}
-    if(DB.members.some(m=>m.username.toLowerCase()===un.toLowerCase())){msg.textContent='That username is already taken.';return;}
-    if(DB.members.some(m=>(m.email||'').toLowerCase()===em.toLowerCase())){msg.textContent='That email is already registered.';return;}
-    btn.disabled=true;btn.textContent='Creating…';msg.textContent='';
-    const passwordHash=await hashPw(pw);
-    DB.uid_seq++;const id=Date.now();
-    const u={id,uid:'ZM'+String(DB.uid_seq).padStart(4,'0'),username:un,email:em,passwordHash,role:'Member',
-      avatar:null,bio:'',status_msg:'',privacy:'public',verified:0,status:'online',events_won:0,total_posts:0,
-      achievements:'',badges:[],socials:[],effects:{},frame:'',theme:'',layout:'Classic',hiddenBadges:[],
-      rules_version:0,join_date:day(0),created_at:new Date().toISOString(),points:50};
-    DB.members.push(u);
-    DB.notifications.push({id:Date.now(),user_id:u.id,title:'Welcome to Zero Mercy',body:'Your account is ready. Apply to become an official member.',read:0,created_at:new Date().toISOString()});
-    DB.session=u.id;save();btn.textContent='Created';toast('Account created — welcome!','ok');
-    setTimeout(()=>go('home'),200);
+    const fail=m=>{msg.style.color='var(--accent-2)';msg.textContent=m;btn.disabled=false;btn.textContent='Create account';};
+
+    if(un.length<3)return fail('Username must be at least 3 characters.');
+    if(pw.length<6)return fail('Password must be at least 6 characters.');
+    if(!/^\S+@\S+\.\S+$/.test(em))return fail('Enter a valid email address.');
+    if(DB.members.some(m=>m.username.toLowerCase()===un.toLowerCase()))return fail('That username is already taken.');
+    if(DB.members.some(m=>(m.email||'').toLowerCase()===em.toLowerCase()))return fail('That email is already registered.');
+
+    msg.textContent='';
+    btn.disabled=true;btn.textContent='Creating…';
+
+    /* ---- real account (Firebase) ---- */
+    if(fbReady()){
+      try{
+        const user=await window.ZMFB.fb.signUp(em,pw,un);
+        const zmId='ZM'+String(DB.uid_seq+1).padStart(4,'0');
+        await window.ZMFB.fb.saveProfile(user.uid,{
+          uid:user.uid, zmId, username:un, email:em,
+          role:'Member', points:0, eventsWon:0, totalPosts:0,
+          bio:'', statusMsg:'', privacy:'public', verified:false,
+          badges:[], socials:[], frame:'', banner:'',
+          hiddenBadges:[], rulesVersion:0,
+          joinDate:new Date().toISOString(), createdAt:window.ZMFB.fb.now()
+        });
+        const mid=await fbSyncSession(user.uid);
+        if(mid)DB.notifications.push({id:Date.now(),user_id:mid,title:'Welcome to Zero Mercy',body:'Your account is ready. Apply to become an official member.',read:0,created_at:new Date().toISOString()});
+        save();
+        btn.textContent='Created';toast('Account created — welcome!','ok');
+        setTimeout(()=>go('home'),200);
+        return;
+      }catch(err){
+        return fail(fbErr(err));
+      }
+    }
+
+    /* ---- built-in demo account (no Firebase) ---- */
+    try{
+      const passwordHash=await hashPw(pw);
+      DB.uid_seq++;const id=Date.now();
+      const u={id,uid:'ZM'+String(DB.uid_seq).padStart(4,'0'),username:un,email:em,passwordHash,role:'Member',
+        avatar:null,bio:'',status_msg:'',privacy:'public',verified:0,status:'online',events_won:0,total_posts:0,
+        achievements:'',badges:[],socials:[],effects:{},frame:'',banner:'',layout:'Classic',hiddenBadges:[],
+        region:'Asia',playstyle:'Competitive',fav_game:'Battle Royale',
+        rules_version:0,join_date:day(0),created_at:new Date().toISOString(),points:50};
+      DB.members.push(u);
+      DB.notifications.push({id:Date.now(),user_id:u.id,title:'Welcome to Zero Mercy',body:'Your account is ready. Apply to become an official member.',read:0,created_at:new Date().toISOString()});
+      DB.session=u.id;save();btn.textContent='Created';toast('Account created — welcome!','ok');
+      setTimeout(()=>go('home'),200);
+    }catch(err){
+      fail('Could not create the account. Please try again.');
+    }
   };
 }
+
 
 /* ---------- customization ---------- */
 function vEditProfile(){
@@ -3512,17 +3664,33 @@ let PRESENCE_KEY='';
 <script type="module">
 (async () => {
   const V = "10.14.1";
-  const BASES = [
-    "https://www.gstatic.com/firebasejs/" + V + "/",
-    "https://cdn.jsdelivr.net/npm/firebase@" + V + "/"
+  /* gstatic is the official CDN. The jsDelivr "+esm" build is a self-contained
+     mirror that never touches gstatic, so it still works where gstatic is blocked. */
+  /* gstatic is the official CDN. esm.sh is a fully self-contained mirror that
+     never touches gstatic. The ?deps= pins matter: without them esm.sh loads a
+     second copy of @firebase/app and Firebase reports "Component auth has not
+     been registered yet". */
+  const SOURCES = [
+    { name:"gstatic",
+      app:"https://www.gstatic.com/firebasejs/"+V+"/firebase-app.js",
+      auth:"https://www.gstatic.com/firebasejs/"+V+"/firebase-auth.js",
+      db:"https://www.gstatic.com/firebasejs/"+V+"/firebase-firestore.js",
+      an:"https://www.gstatic.com/firebasejs/"+V+"/firebase-analytics.js" },
+    { name:"esm.sh",
+      app:"https://esm.sh/@firebase/app@0.10.13",
+      auth:"https://esm.sh/@firebase/auth@1.7.9?deps=@firebase/app@0.10.13",
+      db:"https://esm.sh/@firebase/firestore@4.7.3?deps=@firebase/app@0.10.13",
+      an:"https://esm.sh/@firebase/analytics@0.10.8?deps=@firebase/app@0.10.13" }
   ];
-  const state = { ready:false, app:null, analytics:null, source:null, error:null };
+
+  const state = { ready:false, app:null, analytics:null, auth:null, db:null, fb:null, source:null, error:null };
   window.ZMFB = state;
+  window.ZMAUTH = { mode:"demo", user:null };
   const announce = () => window.dispatchEvent(new CustomEvent("zmfb-status"));
 
-  for (const base of BASES) {
+  for (const src of SOURCES) {
     try {
-      const { initializeApp } = await import(base + "firebase-app.js");
+      const { initializeApp } = await import(src.app);
       const app = initializeApp({
         apiKey: "AIzaSyDlkEc43vZDTMA5o1Yb9Y1pywALEviBods",
         authDomain: "bv-martket-91f88.firebaseapp.com",
@@ -3533,18 +3701,51 @@ let PRESENCE_KEY='';
         measurementId: "G-GSQNZTQT90"
       });
       state.app = app;
-      state.source = base.indexOf("gstatic") > -1 ? "gstatic" : "jsdelivr";
+      state.source = src.name;
+
       try {
-        const { getAnalytics, isSupported } = await import(base + "firebase-analytics.js");
+        const { getAnalytics, isSupported } = await import(src.an);
         if (await isSupported()) state.analytics = getAnalytics(app);
       } catch (e) { /* analytics is optional */ }
+
+      const A = await import(src.auth);
+      const F = await import(src.db);
+      const auth = A.getAuth(app);
+      const db = F.getFirestore(app);
+      state.auth = auth;
+      state.db = db;
+      state.fb = {
+        signIn: (email, pw) => A.signInWithEmailAndPassword(auth, email, pw),
+        signUp: async (email, pw, name) => {
+          const cred = await A.createUserWithEmailAndPassword(auth, email, pw);
+          try { await A.updateProfile(cred.user, { displayName: name }); } catch (e) {}
+          return cred.user;
+        },
+        signOut: () => A.signOut(auth),
+        resetPassword: (email) => A.sendPasswordResetEmail(auth, email),
+        getProfile: async (uid) => {
+          const snap = await F.getDoc(F.doc(db, "users", uid));
+          return snap.exists() ? snap.data() : null;
+        },
+        saveProfile: (uid, data) => F.setDoc(F.doc(db, "users", uid), data, { merge: true }),
+        now: () => F.serverTimestamp(),
+        current: () => auth.currentUser
+      };
+      A.onAuthStateChanged(auth, (user) => {
+        window.ZMAUTH.mode = "firebase";
+        window.ZMAUTH.user = user || null;
+        window.dispatchEvent(new CustomEvent("zmauth", { detail: { uid: user ? user.uid : null, email: user ? user.email : null } }));
+      });
       state.ready = true;
       break;
     } catch (e) {
       state.error = (e && e.message) || String(e);
     }
   }
-  if (!state.ready) console.warn("[ZERO MERCY] Firebase not loaded — running offline:", state.error);
+  if (!state.ready) {
+    window.ZMAUTH.mode = "demo";
+    console.warn("[ZERO MERCY] Firebase not loaded — running offline:", state.error);
+  }
   announce();
 })();
 </script>
