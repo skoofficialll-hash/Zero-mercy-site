@@ -1190,9 +1190,68 @@ function typingLabel(ch){
    CONFIG — fill this in after you deploy the LiveKit token Worker
    ============================================================================ */
 window.ZM_CONFIG = window.ZM_CONFIG || {
-  /* e.g. "https://zero-mercy-voice.your-name.workers.dev" */
-  livekitTokenUrl: ""
+  /* Voice Jitsi se chalta hai — free, koi account nahi, koi server nahi.
+     Room ke naam khud ban jaate hain, isliye kuch bhi bharna nahi hai. */
+  voiceHost: "meet.jit.si",
+  voicePrefix: "ZeroMercy-ZM"
 };
+
+/* ============================================================================
+   VOICE  (free, no server, no account)
+   Jitsi Meet ka public server use hota hai. Har voice channel ka apna room
+   naam hota hai, isliye kuch configure karne ki zaroorat nahi. Koi token,
+   koi secret, koi API key — kuch bhi client tak nahi jaata.
+   ============================================================================ */
+const voiceHost=()=>String((window.ZM_CONFIG&&window.ZM_CONFIG.voiceHost)||"meet.jit.si").trim();
+const voicePrefix=()=>String((window.ZM_CONFIG&&window.ZM_CONFIG.voicePrefix)||"ZeroMercy-ZM").trim();
+/* har channel ka apna room naam — kuch configure karne ki zaroorat nahi */
+const hmsCode=id=>voicePrefix()+"-"+String(id).replace(/[^A-Za-z0-9-]/g,"");
+const hmsReady=()=>!!voiceHost();
+function hmsLink(channelId){
+  const room=hmsCode(channelId);
+  let url="https://"+voiceHost()+"/"+room;
+  const u=me();
+  if(u){
+    /* Jitsi ko naam bhejo taaki khud bhar jaaye */
+    url+="#userInfo.displayName=%22"+encodeURIComponent(u.username)+"%22&config.prejoinPageEnabled=false";
+  }
+  return url;
+}
+let HMS_ACTIVE=null;
+
+function hmsListView(){
+  const rooms=DB.channels.filter(c=>c.type==='voice'&&chVisible(c));
+  return `<div class="page">
+    <div class="page-head"><div><div class="eyebrow">Live audio</div><h1>Voice Rooms</h1>
+      <p>Room chuno aur baat karo — free voice, koi account nahi chahiye.</p></div></div>
+    <div class="grid g2">${rooms.length?rooms.map(c=>{
+      return `<div class="voice-card">
+        <h4>${ico('voice')} ${esc(c.name)} ${c.privacy!=='public'?`<span class="pill amber">${ico('lock')} Restricted</span>`:''}</h4>
+        <p>${esc(c.desc||'')}</p>
+        <div class="foot"><span class="count">${hmsCode(c.id)}</span>
+          <button class="btn btn-primary btn-sm" data-hmsjoin="${esc(c.id)}">Join voice</button></div>
+      </div>`;}).join('')
+      :stateBlock('empty',{title:'No voice rooms',msg:'You do not have access to any voice rooms yet.'})}</div>
+  </div>`;
+}
+function hmsRoomView(channelId){
+  const ch=DB.channels.find(c=>c.id===channelId)||{name:'Voice Room'};
+  return `<div class="page" style="max-width:1040px">
+    <div class="room" style="margin-bottom:18px">
+      <div class="room-head">
+        <button class="btn btn-icon btn-ghost hide-lg" id="hmsBack" aria-label="Back">${ico('left')}</button>
+        ${ico('voice')}<h3>${esc(ch.name)}</h3>
+        <span class="pill green">Live audio</span>
+        <span class="dim hide-sm" style="font-size:var(--fs-sm)">${esc((me()||{}).username||'')}</span>
+        <span class="count dim" style="font-size:var(--fs-sm);margin-left:auto">free voice · Jitsi</span>
+      </div>
+      <iframe id="hmsFrame" title="${esc(ch.name)}"
+        src="${esc(hmsLink(channelId))}"
+        allow="camera; microphone; fullscreen; display-capture; autoplay; clipboard-write"
+        style="width:100%;height:min(72vh,660px);border:1px solid var(--line);border-radius:var(--r-lg);background:#0b0c0e;display:block"></iframe>
+      <p class="dim" style="font-size:var(--fs-sm);margin-top:11px">Mic permission pehli baar maangega — <strong>Allow</strong> karo. Audio record nahi hota.</p>
+    </div></div>`;
+}
 
 /* ============================================================================
    LIVEKIT VOICE
@@ -2251,12 +2310,13 @@ function channelModal(existing){
 
 /* ---------- voice ---------- */
 function vVoice(){
+  if(hmsReady())return HMS_ACTIVE?hmsRoomView(HMS_ACTIVE):hmsListView();
   const u=me();
   const rooms=DB.channels.filter(c=>c.type==='voice'&&chVisible(c));
   const joined=VOICE?DB.channels.find(c=>c.id===VOICE):null;
   return `<div class="page">
     <div class="page-head"><div><div class="eyebrow">Live audio</div><h1>Voice Rooms</h1>
-      <p>${lkReady()?'Join a room and talk — audio runs live through LiveKit.':lkConfigured()?'Voice is configured, but you need a real account (Google or email) to join.':'Voice is not configured yet — deploy the token Worker and add its URL to ZM_CONFIG.livekitTokenUrl.'}</p></div></div>
+      <p>Join a room and talk — free voice, koi server nahi.</p></div></div>
     ${joined?voiceRoom(joined):''}
     ${!joined?`<div class="grid g2">${rooms.length?rooms.map(c=>{
       const st=DB.voice[c.id]||{members:[]};
@@ -2353,6 +2413,11 @@ function voiceRoom(ch){
   </div>`;
 }
 function wireVoice(){
+  if(hmsReady()){
+    $$('[data-hmsjoin]').forEach(b=>b.onclick=()=>{HMS_ACTIVE=b.dataset.hmsjoin;render();});
+    const bk=$('#hmsBack');if(bk)bk.onclick=()=>{HMS_ACTIVE=null;render();};
+    return;
+  }
   wireActs({
     vtry:()=>{ if(lkConfigured())lkVoiceJoin(LK_ROOMNAME||VOICE); else joinVoice(VOICE); },
     vleave:()=>{ if(LK_ROOM)lkVoiceLeave(); else { leaveVoice(); go('voice'); } }
